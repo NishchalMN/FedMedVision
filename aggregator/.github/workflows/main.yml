@@ -1,0 +1,157 @@
+name: Build, Push, and Deploy FastAPI App
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/fedmedvision-app
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+            type=semver,pattern={{version}},value=v1.0.${{ github.run_number }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new
+          build-args: |
+            APP_VERSION=1.0.${{ github.run_number }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  deploy:
+    name: Deploy to Ubuntu Server
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Prepare deployment files
+        run: |
+          mkdir -p deploy
+          cat > deploy/docker-compose.yml << EOF
+          version: '3.8'
+          
+          services:
+            fastapi:
+              image: ${{ secrets.DOCKERHUB_USERNAME }}/fedmedvision-app:latest
+              container_name: fedmedvision-app
+              restart: always
+              ports:
+                - "8000:8000"
+              volumes:
+                - ./data:/app/data
+                - ./shared:/mnt/shared
+                - ./db:/app/db
+              environment:
+                - DATABASE_URL=sqlite:///./db/fedmedvision.db
+                - MLFLOW_TRACKING_URI=http://fedadmin:fedmed@localhost:8080
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 40s
+          
+          # Uncomment if you need MLflow running alongside your app
+          # Note: This is a basic setup and you might need to adjust it
+          #  mlflow:
+          #    image: ghcr.io/mlflow/mlflow:latest
+          #    container_name: mlflow
+          #    restart: always
+          #    ports:
+          #      - "8080:5000"
+          #    volumes:
+          #      - ./mlruns:/mlruns
+          #    environment:
+          #      - MLFLOW_TRACKING_URI=http://localhost:5000
+          #      - MLFLOW_ARTIFACT_ROOT=/mlruns
+          EOF
+
+      - name: Deploy to server
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: deployer
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "deploy/*"
+          target: "/home/deployer/fedmedvision-app"
+          rm: true
+          strip_components: 1
+
+      - name: Execute remote deployment commands
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: deployer
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/deployer/fedmedvision-app
+            mkdir -p data shared db
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/fedmedvision-app:latest
+            docker compose down --remove-orphans
+            docker compose up -d
+            docker system prune -af --volumes
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: deployer
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Checking container status:"
+            docker ps | grep fedmedvision-app
+            echo "Waiting for application to start..."
+            # Wait up to 2 minutes for the app to be available
+            for i in {1..12}; do
+              echo "Attempt $i - checking if application is responding..."
+              if curl -s http://localhost:8000 > /dev/null; then
+                echo "Deployment successful - application is responding"
+                exit 0
+              fi
+              echo "Application not yet responding, waiting 10 seconds..."
+              sleep 10
+            done
+            echo "Deployment verification failed - application did not respond within timeout"
+            docker logs fedmedvision-app
+            exit 1

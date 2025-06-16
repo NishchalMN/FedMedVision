@@ -1,0 +1,16 @@
+services:
+  client:
+    image: fl-client:latest
+    container_name: fl-client
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./data:/app/data
+      - ./client_3.csv:/app/client_data.csv
+    restart: no
+    network_mode: host
